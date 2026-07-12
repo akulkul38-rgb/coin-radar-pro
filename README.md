@@ -1,57 +1,55 @@
-# Coin Radar Stable v1
+# Coin Radar AI — Stable Adaptive Edition
 
-Bu sürüm, tekrar tekrar tüm projeyi değiştirmemek için hazırlanmış kararlı
-tek-dosya sürümüdür.
+Bu sürüm Binance TR TRY paritelerini 5 dk, 15 dk, 1 saat ve 4 saat zaman dilimlerinde tarar.
 
-## Dahil edilenler
+## Ana fark
 
-- Binance TR TRY paritelerini otomatik keşfetme
-- 5 dk, 15 dk, 1 saat, 4 saat analiz
-- EMA, RSI, MACD, Bollinger, ATR, RVOL, spread ve BTC filtresi
-- Giriş, stop, tam satış, risk/ödül ve maksimum bekleme süresi
-- Günlük sinyal sınırı yok
-- Coin bazlı tekrar sinyali kontrolü
-- Kâğıt işlem sonucu takibi
-- Kendi performansından sınırlı öğrenme
-- Telegram sağlık mesajı
-- Telegram performans raporu
-- Railway Variables üzerinden ayar değiştirme
-- SQLite kalıcı öğrenme verisi
+Sabit `%4` satış hedefi kaldırılmıştır. İlk karar bölgesi ve hedef alanı şu verilerden dinamik hesaplanır:
 
-## Bundan sonra kod değiştirmeden ayarlanabilecek başlıca değerler
+- ATR ve stop mesafesi
+- Yakın/uzak dirençler
+- EMA trend dizilimi
+- ADX trend gücü
+- RSI, MACD ve Bollinger yapısı
+- Göreceli hacim
+- BTC piyasa bağlamı
+- Geçmiş sinyallerin MFE ve getiri sonuçları
 
-- MIN_SCORE
-- MIN_24H_TRY_VOLUME
-- MAX_24H_CHANGE
-- MAX_SPREAD_PERCENT
-- MAX_STOP_PERCENT
-- MIN_RISK_REWARD
-- PREFERRED_TARGET_PERCENT
-- MAX_HOLD_HOURS
-- COOLDOWN_MINUTES
-- SCAN_INTERVAL_SECONDS
+İlk hedefe ulaşılması otomatik tam satış anlamına gelmez. Trend güçlü kalırsa takip eden stop yükseltilir.
 
-## Railway Volume
+## Railway değişkenleri
 
-Öğrenme verisinin deploy sonrasında silinmemesi için Worker servisine bir
-Volume bağla ve mount path olarak:
+Zorunlu:
 
-`/data`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
 
-kullan.
+Önerilen:
 
-Kod veritabanını burada tutar:
+- `SCAN_INTERVAL_SECONDS=180`
+- `MIN_SCORE=80`
+- `MIN_24H_TRY_VOLUME=15000000`
+- `MAX_SPREAD_PERCENT=0.70`
+- `MAX_STOP_PERCENT=3.20`
+- `MIN_STOP_PERCENT=0.70`
+- `MIN_RISK_REWARD=1.60`
+- `MAX_HOLD_HOURS=12`
+- `LEARNING_ENABLED=true`
+- `LEARNING_MIN_SAMPLES=20`
+- `LEARNING_DB_PATH=/data/radar_learning.db`
 
-`/data/radar_learning.db`
+Railway Volume mount path: `/data`
 
-## İlk güvenli kullanım
+## Kurulum
 
-İlk 30–50 sonuç kâğıt işlem verisi olarak toplanmalı. Öğrenme katmanı en az
-10 örnek oluşmadan herhangi bir özellik ağırlığını değiştirmez.
+```bash
+pip install -r requirements.txt
+python main.py
+```
 
 ## Güvenlik
 
-- Telegram token'ını GitHub'a yazma.
-- Binance API anahtarı gerekmez.
-- Sistem otomatik emir vermez.
-- Bu sistem kazanç garantisi vermez.
+- Otomatik emir vermez.
+- Binance API anahtarı istemez.
+- Kazanç garantisi vermez.
+- Öğrenme sistemi maksimum stop sınırını gevşetemez.
