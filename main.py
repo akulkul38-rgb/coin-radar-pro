@@ -1,12 +1,15 @@
 """
-Coin Radar Pro v3 — Binance TR TRY market scanner.
+Coin Radar Stable v1
+--------------------
+Binance TR TRY paritelerini tarar, Telegram'a aday gönderir, kâğıt işlem
+sonuçlarını kaydeder ve geçmiş performansa göre sınırlı/temkinli öğrenme yapar.
 
-- Public market data only; no exchange API key and no automatic orders.
-- Scans every TRY symbol exposed by Binance TR's market ticker endpoint.
-- Uses ticker-derived symbol discovery first, avoiding the geo-sensitive
-  www.binance.tr/open/v1/common/symbols endpoint that can return HTTP 451.
-- Sends every setup that passes the quality filters.
-- There is no fixed daily alert cap.
+ÖNEMLİ:
+- Otomatik alım-satım yapmaz.
+- Borsa API anahtarı istemez.
+- Günlük sinyal sayısı sınırı yoktur.
+- Aynı kurulumun tekrar tekrar gönderilmesini cooldown ile engeller.
+- Öğrenme katmanı temel risk kurallarını değiştiremez.
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ import logging
 import math
 import os
 import random
+import re
+import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -27,15 +32,15 @@ import pandas as pd
 import requests
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ============================================================
+# CONFIG
+# ============================================================
 
 def env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
+    raw = os.getenv(name)
+    if raw is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on", "evet"}
+    return raw.strip().lower() in {"1", "true", "yes", "on", "evet"}
 
 
 def env_int(name: str, default: int) -> int:
@@ -70,13 +75,19 @@ class Settings:
 
     cooldown_minutes: int
     resignal_score_improvement: float
+
     btc_filter_enabled: bool
     send_startup_message: bool
     heartbeat_minutes: int
-    dry_run: bool
+    performance_report_hours: int
 
-    state_file: str
-    signal_log_file: str
+    learning_enabled: bool
+    learning_db_path: str
+    learning_min_samples: int
+    learning_max_bonus: float
+    learning_review_minutes: int
+
+    dry_run: bool
     log_level: str
 
     @classmethod
@@ -96,8 +107,9 @@ class Settings:
             telegram_chat_id=chat_id,
             scan_interval_seconds=max(60, env_int("SCAN_INTERVAL_SECONDS", 300)),
             request_timeout_seconds=max(5, env_int("REQUEST_TIMEOUT_SECONDS", 12)),
-            request_pause_seconds=max(0.04, env_float("REQUEST_PAUSE_SECONDS", 0.08)),
-            max_prefilter_symbols=max(10, env_int("MAX_PREFILTER_SYMBOLS", 45)),
+            request_pause_seconds=max(0.03, env_float("REQUEST_PAUSE_SECONDS", 0.08)),
+            max_prefilter_symbols=max(10, env_int("MAX_PREFILTER_SYMBOLS", 50)),
+
             min_score=env_float("MIN_SCORE", 80),
             min_24h_try_volume=env_float("MIN_24H_TRY_VOLUME", 15_000_000),
             min_24h_change=env_float("MIN_24H_CHANGE", -3),
@@ -109,21 +121,29 @@ class Settings:
             min_target_percent=env_float("MIN_TARGET_PERCENT", 2.2),
             max_target_percent=env_float("MAX_TARGET_PERCENT", 7.0),
             max_hold_hours=max(1, env_int("MAX_HOLD_HOURS", 8)),
+
             cooldown_minutes=max(15, env_int("COOLDOWN_MINUTES", 120)),
             resignal_score_improvement=env_float("RESIGNAL_SCORE_IMPROVEMENT", 5),
+
             btc_filter_enabled=env_bool("BTC_FILTER_ENABLED", True),
             send_startup_message=env_bool("SEND_STARTUP_MESSAGE", True),
             heartbeat_minutes=max(5, env_int("HEARTBEAT_MINUTES", 30)),
+            performance_report_hours=max(1, env_int("PERFORMANCE_REPORT_HOURS", 24)),
+
+            learning_enabled=env_bool("LEARNING_ENABLED", True),
+            learning_db_path=os.getenv("LEARNING_DB_PATH", "/data/radar_learning.db"),
+            learning_min_samples=max(5, env_int("LEARNING_MIN_SAMPLES", 10)),
+            learning_max_bonus=env_float("LEARNING_MAX_BONUS", 10.0),
+            learning_review_minutes=max(5, env_int("LEARNING_REVIEW_MINUTES", 15)),
+
             dry_run=dry_run,
-            state_file=os.getenv("STATE_FILE", "state.json"),
-            signal_log_file=os.getenv("SIGNAL_LOG_FILE", "signals.jsonl"),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
+# ============================================================
+# MODELS
+# ============================================================
 
 @dataclass(frozen=True)
 class Metrics:
@@ -166,6 +186,8 @@ class MarketContext:
 class Signal:
     symbol: str
     score: float
+    raw_score: float
+    learning_bonus: float
     price: float
     entry_low: float
     entry_high: float
@@ -187,21 +209,19 @@ class Signal:
             self.created_at = datetime.now(timezone.utc).isoformat()
 
 
-# ---------------------------------------------------------------------------
-# HTTP and Binance TR public market client
-# ---------------------------------------------------------------------------
+# ============================================================
+# HTTP / EXCHANGE
+# ============================================================
 
 class HttpClient:
     def __init__(self, timeout: int):
         self.timeout = timeout
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "CoinRadarPro/3.0",
-                "Accept": "application/json",
-                "Connection": "keep-alive",
-            }
-        )
+        self.session.headers.update({
+            "User-Agent": "CoinRadarStable/1.0",
+            "Accept": "application/json",
+            "Connection": "keep-alive",
+        })
 
     def get_json(
         self,
@@ -212,17 +232,13 @@ class HttpClient:
         last_error: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
             try:
-                response = self.session.get(
-                    url, params=params, timeout=self.timeout
-                )
+                response = self.session.get(url, params=params, timeout=self.timeout)
                 if response.status_code in {418, 429}:
                     retry_after = int(response.headers.get("Retry-After", "20"))
                     raise RuntimeError(f"Rate limit; retry_after={retry_after}")
                 response.raise_for_status()
                 payload = response.json()
-                if isinstance(payload, dict) and payload.get("code") not in (
-                    None, 0, "0"
-                ):
+                if isinstance(payload, dict) and payload.get("code") not in (None, 0, "0"):
                     raise RuntimeError(str(payload))
                 return payload.get("data", payload) if isinstance(payload, dict) else payload
             except Exception as exc:
@@ -230,11 +246,8 @@ class HttpClient:
                 if attempt < attempts:
                     delay = min(15.0, (2 ** (attempt - 1)) + random.random())
                     logging.warning(
-                        "HTTP denemesi başarısız %s/%s: %s; %.1fs bekleniyor",
-                        attempt,
-                        attempts,
-                        exc,
-                        delay,
+                        "HTTP %s/%s başarısız: %s; %.1fs bekleniyor",
+                        attempt, attempts, exc, delay
                     )
                     time.sleep(delay)
         raise RuntimeError(f"GET başarısız: {url}: {last_error}")
@@ -243,9 +256,7 @@ class HttpClient:
         last_error: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
             try:
-                response = self.session.post(
-                    url, json=payload, timeout=self.timeout
-                )
+                response = self.session.post(url, json=payload, timeout=self.timeout)
                 response.raise_for_status()
                 data = response.json()
                 if isinstance(data, dict) and data.get("ok") is False:
@@ -260,11 +271,10 @@ class HttpClient:
 
 class BinanceTRClient:
     """
-    Official Binance TR market endpoints for symbol type 1.
+    Public market endpoints only.
 
-    Symbol discovery intentionally uses the market-wide ticker response rather
-    than /open/v1/common/symbols. The latter may return HTTP 451 from some
-    cloud regions and previously blocked startup.
+    Symbol discovery uses market-wide ticker data. This avoids the cloud-region
+    HTTP 451 problem that can affect the common/symbols endpoint.
     """
 
     MARKET_BASES = (
@@ -351,9 +361,9 @@ class BinanceTRClient:
         return df.dropna(subset=["open", "high", "low", "close", "volume"])
 
 
-# ---------------------------------------------------------------------------
-# Indicators
-# ---------------------------------------------------------------------------
+# ============================================================
+# INDICATORS
+# ============================================================
 
 def safe_float(value: Any, fallback: float = 0.0) -> float:
     try:
@@ -447,9 +457,324 @@ def calculate_metrics(df: pd.DataFrame) -> Metrics:
     )
 
 
-# ---------------------------------------------------------------------------
-# Strategy
-# ---------------------------------------------------------------------------
+# ============================================================
+# LEARNING DATABASE
+# ============================================================
+
+class LearningEngine:
+    """
+    Bounded online learning.
+
+    - Records every sent signal as a paper trade.
+    - Reviews target/stop/max-hold outcome.
+    - Learns feature win rates with Beta priors.
+    - Adds only a bounded score bonus/penalty.
+    - Never changes stop limits or minimum risk/reward.
+    """
+
+    def __init__(
+        self,
+        db_path: str,
+        enabled: bool,
+        min_samples: int,
+        max_bonus: float,
+    ):
+        self.enabled = enabled
+        self.min_samples = min_samples
+        self.max_bonus = max_bonus
+        self.db_path = Path(db_path)
+        if self.enabled:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init_db()
+
+    def _connect(self):
+        return sqlite3.connect(self.db_path, timeout=30)
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    entry REAL NOT NULL,
+                    stop REAL NOT NULL,
+                    target REAL NOT NULL,
+                    max_hold_hours INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    features_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    outcome TEXT,
+                    closed_at REAL,
+                    realized_return REAL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS feature_stats (
+                    feature TEXT PRIMARY KEY,
+                    wins REAL NOT NULL DEFAULT 3.0,
+                    losses REAL NOT NULL DEFAULT 2.0,
+                    samples INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            conn.commit()
+
+    @staticmethod
+    def normalize_feature(reason: str) -> str:
+        text = reason.lower().strip()
+        text = re.sub(r"\([^)]*\)", "", text)
+        text = re.sub(r"%?-?\d+(?:[.,]\d+)?x?", "#", text)
+        text = re.sub(r"\s+", " ", text)
+        return text[:120]
+
+    def tags(self, reasons: List[str]) -> List[str]:
+        return sorted(set(
+            self.normalize_feature(x)
+            for x in reasons
+            if self.normalize_feature(x)
+        ))
+
+    def adaptive_bonus(self, reasons: List[str]) -> float:
+        if not self.enabled:
+            return 0.0
+
+        bonus = 0.0
+        with self._connect() as conn:
+            for tag in self.tags(reasons):
+                row = conn.execute(
+                    "SELECT wins, losses, samples FROM feature_stats WHERE feature=?",
+                    (tag,),
+                ).fetchone()
+                if not row:
+                    continue
+                wins, losses, samples = row
+                if samples < self.min_samples:
+                    continue
+                posterior = wins / max(wins + losses, 1e-12)
+                feature_bonus = max(-2.5, min(2.5, (posterior - 0.60) * 12.0))
+                bonus += feature_bonus
+        return max(-self.max_bonus, min(self.max_bonus, bonus))
+
+    def record_signal(self, signal: Signal) -> None:
+        if not self.enabled:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO signals
+                (symbol, created_at, entry, stop, target, max_hold_hours,
+                 score, features_json, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+                """,
+                (
+                    signal.symbol,
+                    time.time(),
+                    signal.entry_high,
+                    signal.stop,
+                    signal.target,
+                    signal.max_hold_hours,
+                    signal.score,
+                    json.dumps(self.tags(signal.reasons), ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+
+    def open_signals(self) -> List[tuple]:
+        if not self.enabled:
+            return []
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, symbol, created_at, entry, stop, target,
+                       max_hold_hours, features_json
+                FROM signals WHERE status='OPEN'
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+
+    def close_signal(
+        self,
+        signal_id: int,
+        outcome: str,
+        realized_return: float,
+        features_json: str,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        now = time.time()
+        features = json.loads(features_json)
+        if outcome == "WIN":
+            win_credit, loss_credit = 1.0, 0.0
+        elif outcome == "LOSS":
+            win_credit, loss_credit = 0.0, 1.0
+        else:
+            win_credit, loss_credit = 0.5, 0.5
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE signals
+                SET status='CLOSED', outcome=?, closed_at=?, realized_return=?
+                WHERE id=?
+                """,
+                (outcome, now, realized_return, signal_id),
+            )
+
+            for feature in features:
+                existing = conn.execute(
+                    "SELECT wins, losses, samples FROM feature_stats WHERE feature=?",
+                    (feature,),
+                ).fetchone()
+
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE feature_stats
+                        SET wins=?, losses=?, samples=?, updated_at=?
+                        WHERE feature=?
+                        """,
+                        (
+                            existing[0] + win_credit,
+                            existing[1] + loss_credit,
+                            existing[2] + 1,
+                            now,
+                            feature,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO feature_stats
+                        (feature, wins, losses, samples, updated_at)
+                        VALUES (?, ?, ?, 1, ?)
+                        """,
+                        (
+                            feature,
+                            3.0 + win_credit,
+                            2.0 + loss_credit,
+                            now,
+                        ),
+                    )
+            conn.commit()
+
+    def review_open_signals(self, exchange: BinanceTRClient) -> int:
+        if not self.enabled:
+            return 0
+
+        closed = 0
+        now = time.time()
+
+        for row in self.open_signals():
+            (
+                signal_id, symbol, created_at, entry, stop, target,
+                max_hold_hours, features_json
+            ) = row
+
+            try:
+                df = exchange.klines(symbol, "5m", 500)
+                if "open_time" not in df.columns:
+                    continue
+
+                bars = df[df["open_time"] >= int(created_at * 1000)]
+                if bars.empty:
+                    continue
+
+                outcome = None
+                realized_return = 0.0
+
+                for _, candle in bars.iterrows():
+                    low = float(candle["low"])
+                    high = float(candle["high"])
+                    hit_stop = low <= stop
+                    hit_target = high >= target
+
+                    if hit_stop and hit_target:
+                        outcome = "LOSS"
+                        realized_return = (stop - entry) / entry * 100
+                        break
+                    if hit_stop:
+                        outcome = "LOSS"
+                        realized_return = (stop - entry) / entry * 100
+                        break
+                    if hit_target:
+                        outcome = "WIN"
+                        realized_return = (target - entry) / entry * 100
+                        break
+
+                if outcome is None and now - created_at >= max_hold_hours * 3600:
+                    last_close = float(bars.iloc[-1]["close"])
+                    realized_return = (last_close - entry) / entry * 100
+                    if realized_return >= 0.8:
+                        outcome = "WIN"
+                    elif realized_return <= -0.8:
+                        outcome = "LOSS"
+                    else:
+                        outcome = "NEUTRAL"
+
+                if outcome:
+                    self.close_signal(
+                        signal_id,
+                        outcome,
+                        realized_return,
+                        features_json,
+                    )
+                    logging.info(
+                        "Öğrenme sonucu: %s %s %.2f%%",
+                        symbol, outcome, realized_return
+                    )
+                    closed += 1
+
+            except Exception as exc:
+                logging.warning(
+                    "Açık sinyal değerlendirilemedi %s: %s",
+                    symbol, exc
+                )
+
+        return closed
+
+    def summary(self) -> Dict[str, float]:
+        if not self.enabled:
+            return {
+                "closed": 0,
+                "wins": 0,
+                "losses": 0,
+                "neutral": 0,
+                "win_rate": 0.0,
+                "average_return": 0.0,
+            }
+
+        with self._connect() as conn:
+            closed = conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE status='CLOSED'"
+            ).fetchone()[0]
+            wins = conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE outcome='WIN'"
+            ).fetchone()[0]
+            losses = conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE outcome='LOSS'"
+            ).fetchone()[0]
+            neutral = conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE outcome='NEUTRAL'"
+            ).fetchone()[0]
+            avg = conn.execute(
+                "SELECT AVG(realized_return) FROM signals WHERE status='CLOSED'"
+            ).fetchone()[0]
+
+        return {
+            "closed": closed,
+            "wins": wins,
+            "losses": losses,
+            "neutral": neutral,
+            "win_rate": (wins / closed * 100) if closed else 0.0,
+            "average_return": float(avg or 0.0),
+        }
+
+
+# ============================================================
+# STRATEGY
+# ============================================================
 
 def ticker_float(row: dict, *keys: str, default: float = 0.0) -> float:
     for key in keys:
@@ -459,15 +784,18 @@ def ticker_float(row: dict, *keys: str, default: float = 0.0) -> float:
 
 
 def build_market_context(
-    client: BinanceTRClient, tickers: Dict[str, dict]
+    client: BinanceTRClient,
+    tickers: Dict[str, dict],
 ) -> MarketContext:
     symbol = "BTCTRY"
     try:
         m15 = calculate_metrics(client.klines(symbol, "15m"))
         m1h = calculate_metrics(client.klines(symbol, "1h"))
         change = ticker_float(tickers.get(symbol, {}), "priceChangePercent")
+
         ok15 = m15.ema20 >= m15.ema50 and m15.rsi14 >= 43
         ok1h = m1h.ema20 >= m1h.ema50 and m1h.rsi14 >= 42
+
         risk_off = (
             not ok15
             and not ok1h
@@ -475,33 +803,46 @@ def build_market_context(
             and m1h.macd_hist < 0
             and change < -1.5
         )
+
         return MarketContext(
-            symbol, m15.price, change, ok15, ok1h, risk_off
+            btc_symbol=symbol,
+            btc_price=m15.price,
+            btc_change_24h=change,
+            btc_15m_ok=ok15,
+            btc_1h_ok=ok1h,
+            risk_off=risk_off,
         )
+
     except Exception as exc:
-        logging.warning("BTC bağlamı alınamadı; nötr kullanılıyor: %s", exc)
+        logging.warning("BTC bağlamı alınamadı, nötr kullanılıyor: %s", exc)
         return MarketContext("UNKNOWN", 0, 0, True, True, False)
 
 
-def prefilter_score(ticker: dict, book: dict, cfg: Settings) -> Optional[float]:
+def prefilter_score(
+    ticker: dict,
+    book: dict,
+    cfg: Settings,
+) -> Optional[float]:
     change = ticker_float(ticker, "priceChangePercent")
     quote_volume = ticker_float(ticker, "quoteVolume", "quoteQty")
     bid = ticker_float(book, "bidPrice", "bid")
     ask = ticker_float(book, "askPrice", "ask")
+
     if quote_volume < cfg.min_24h_try_volume:
         return None
     if not (cfg.min_24h_change <= change <= cfg.max_24h_change):
         return None
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
+
     spread = (ask - bid) / max((ask + bid) / 2, 1e-12) * 100
     if spread > cfg.max_spread_percent:
         return None
 
-    # Prioritize liquid, moderately moving symbols before expensive candle calls.
     liquidity_component = min(25.0, math.log10(max(quote_volume, 1)) * 3)
     movement_component = 15 - min(15, abs(change - 3.5))
     spread_component = max(0, 10 - spread * 12)
+
     return liquidity_component + movement_component + spread_component
 
 
@@ -515,7 +856,9 @@ def evaluate_signal(
     m4h: Metrics,
     market: MarketContext,
     cfg: Settings,
+    learner: LearningEngine,
 ) -> Optional[Signal]:
+
     price = m15.price
     change = ticker_float(ticker, "priceChangePercent")
     quote_volume = ticker_float(ticker, "quoteVolume", "quoteQty")
@@ -532,7 +875,6 @@ def evaluate_signal(
     reasons: List[str] = []
     warnings: List[str] = []
 
-    # Trend alignment
     if m15.ema20 > m15.ema50:
         score += 11
         reasons.append("15 dk trend yukarı")
@@ -554,7 +896,6 @@ def evaluate_signal(
     if m1h.price > m1h.ema200:
         score += 4
 
-    # Volume expansion without chasing a blow-off candle
     effective_rvol = max(m15.rvol, m15.quote_rvol)
     if 1.30 <= effective_rvol <= 3.8:
         score += 18
@@ -570,7 +911,6 @@ def evaluate_signal(
     if 1.05 <= m15.volume_trend <= 2.8:
         score += 5
 
-    # Momentum
     if 51 <= m15.rsi14 <= 66:
         score += 13
         reasons.append(f"RSI sağlıklı ({m15.rsi14:.0f})")
@@ -588,7 +928,6 @@ def evaluate_signal(
     elif m15.macd_hist < m15.macd_hist_previous:
         score -= 5
 
-    # Bollinger compression / release
     if m15.bb_width_previous < 0.07 and m15.bb_width > m15.bb_width_previous:
         score += 12
         reasons.append("Bollinger sıkışması açılıyor")
@@ -603,6 +942,7 @@ def evaluate_signal(
     breakout_distance = (
         price - m15.prior_high_20
     ) / max(m15.prior_high_20, 1e-12) * 100
+
     if -1.2 <= breakout_distance <= 1.5:
         score += 9
         reasons.append("dirence yakın kontrollü kurulum")
@@ -614,7 +954,6 @@ def evaluate_signal(
         score -= 8
         warnings.append("üst fitil satış baskısı")
 
-    # Daily movement: avoid chasing late-stage moves
     if 0.5 <= change <= 6.5:
         score += 9
         reasons.append(f"24s hareket kontrollü %{change:.1f}")
@@ -632,7 +971,6 @@ def evaluate_signal(
             score -= 8
             warnings.append("BTC 1 saat zayıf")
 
-    # Risk plan
     atr = max(m15.atr14, price * 0.0035)
     support = max(
         m15.ema20,
@@ -640,30 +978,36 @@ def evaluate_signal(
         m15.recent_low_20
         + 0.35 * (m15.recent_high_20 - m15.recent_low_20),
     )
+
     entry_high = min(ask, price + 0.10 * atr)
     entry_low = max(support, price - 0.35 * atr)
     if entry_low > entry_high:
         entry_low = price - 0.15 * atr
 
-    structural_stop = min(entry_low - 1.05 * atr, m15.bb_mid - 0.35 * atr)
+    structural_stop = min(
+        entry_low - 1.05 * atr,
+        m15.bb_mid - 0.35 * atr,
+    )
     stop_floor = entry_high * (1 - cfg.max_stop_percent / 100)
     stop = max(structural_stop, stop_floor)
 
     risk = entry_high - stop
     if risk <= 0:
         return None
-    stop_percent = risk / entry_high * 100
 
+    stop_percent = risk / entry_high * 100
     desired_target_percent = min(
         cfg.max_target_percent,
         max(cfg.min_target_percent, cfg.preferred_target_percent),
     )
+
     target_by_percent = entry_high * (1 + desired_target_percent / 100)
     target_by_rr = entry_high + risk * cfg.min_risk_reward
     target = min(
         max(target_by_percent, target_by_rr),
         entry_high * (1 + cfg.max_target_percent / 100),
     )
+
     target_percent = (target - entry_high) / entry_high * 100
     risk_reward = (target - entry_high) / risk
 
@@ -686,12 +1030,21 @@ def evaluate_signal(
     else:
         score += 4
 
+    raw_score = score
+    learning_bonus = learner.adaptive_bonus(reasons)
+    score += learning_bonus
+
+    if learning_bonus:
+        reasons.append(f"öğrenme etkisi {learning_bonus:+.1f} puan")
+
     if score < cfg.min_score:
         return None
 
     return Signal(
         symbol=symbol,
         score=round(min(score, 100), 1),
+        raw_score=round(raw_score, 1),
+        learning_bonus=round(learning_bonus, 1),
         price=price,
         entry_low=entry_low,
         entry_high=entry_high,
@@ -704,63 +1057,55 @@ def evaluate_signal(
         quote_volume_24h=quote_volume,
         spread_percent=spread,
         max_hold_hours=cfg.max_hold_hours,
-        reasons=reasons[:8],
+        reasons=reasons[:9],
         warnings=warnings[:4],
     )
 
 
-# ---------------------------------------------------------------------------
-# Storage and Telegram
-# ---------------------------------------------------------------------------
+# ============================================================
+# DUPLICATE CONTROL
+# ============================================================
 
-class Storage:
-    def __init__(self, state_file: str, signal_log_file: str):
-        self.state_path = Path(state_file)
-        self.log_path = Path(signal_log_file)
-        self.state = self._load()
-
-    def _load(self) -> dict:
-        try:
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"last_sent": {}}
-
-    def save(self) -> None:
-        temp = self.state_path.with_suffix(".tmp")
-        temp.write_text(
-            json.dumps(self.state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temp.replace(self.state_path)
+class DuplicateStore:
+    def __init__(self, db_path: str):
+        self.db_path = Path(db_path)
 
     def should_send(
         self,
         signal: Signal,
-        now: float,
         cooldown_minutes: int,
         required_improvement: float,
     ) -> bool:
-        previous = self.state.get("last_sent", {}).get(signal.symbol)
-        if not previous:
+        if not self.db_path.exists():
             return True
 
-        elapsed = now - safe_float(previous.get("time"))
-        old_score = safe_float(previous.get("score"))
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT created_at, score
+                FROM signals
+                WHERE symbol=?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (signal.symbol,),
+            ).fetchone()
+
+        if not row:
+            return True
+
+        elapsed = time.time() - float(row[0])
+        old_score = float(row[1])
+
         if elapsed >= cooldown_minutes * 60:
             return True
+
         return signal.score >= old_score + required_improvement
 
-    def mark_sent(self, signal: Signal, now: float) -> None:
-        self.state.setdefault("last_sent", {})[signal.symbol] = {
-            "time": now,
-            "score": signal.score,
-        }
-        self.save()
-        with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(asdict(signal), ensure_ascii=False) + "\n"
-            )
 
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 def format_price(value: float) -> str:
     if value >= 1000:
@@ -783,6 +1128,7 @@ class TelegramNotifier:
         if self.cfg.dry_run:
             logging.info("DRY RUN Telegram:\n%s", text)
             return
+
         self.http.post_json(
             f"https://api.telegram.org/bot{self.cfg.telegram_token}/sendMessage",
             {
@@ -795,20 +1141,41 @@ class TelegramNotifier:
 
     def startup(self) -> None:
         self.send(
-            "✅ <b>Coin Radar Pro v3 çalışıyor</b>\n\n"
-            "Sembol keşfi ticker verisinden yapılıyor.\n"
+            "✅ <b>Coin Radar Stable çalışıyor</b>\n\n"
             "Günlük sinyal sınırı: <b>Yok</b>\n"
             f"Minimum puan: <b>{self.cfg.min_score:.0f}/100</b>\n"
-            "Mod: <b>yalnızca uyarı, otomatik işlem yok</b>"
+            f"Kendi kendine öğrenme: <b>{'Açık' if self.cfg.learning_enabled else 'Kapalı'}</b>\n"
+            "Mod: <b>kâğıt işlem + uyarı</b>\n"
+            "Otomatik alım-satım: <b>Kapalı</b>"
         )
 
-    def heartbeat(self, scanned: int, candidates: int, elapsed: float) -> None:
+    def heartbeat(
+        self,
+        scanned: int,
+        candidates: int,
+        elapsed: float,
+        learning: Dict[str, float],
+    ) -> None:
         self.send(
-            "💓 <b>Coin Radar durum kontrolü</b>\n\n"
+            "💓 <b>Coin Radar sağlık kontrolü</b>\n\n"
             f"Son turda incelenen: <b>{scanned}</b>\n"
             f"Filtreyi geçen: <b>{candidates}</b>\n"
             f"Tarama süresi: <b>{elapsed:.1f} sn</b>\n"
+            f"Sonuçlanan kâğıt işlem: <b>{int(learning['closed'])}</b>\n"
+            f"Başarı oranı: <b>%{learning['win_rate']:.1f}</b>\n"
+            f"Ortalama sonuç: <b>%{learning['average_return']:.2f}</b>\n"
             "Sistem çalışıyor."
+        )
+
+    def performance_report(self, learning: Dict[str, float]) -> None:
+        self.send(
+            "📊 <b>Coin Radar performans raporu</b>\n\n"
+            f"Sonuçlanan sinyal: <b>{int(learning['closed'])}</b>\n"
+            f"Kazanan: <b>{int(learning['wins'])}</b>\n"
+            f"Kaybeden: <b>{int(learning['losses'])}</b>\n"
+            f"Nötr: <b>{int(learning['neutral'])}</b>\n"
+            f"Başarı oranı: <b>%{learning['win_rate']:.1f}</b>\n"
+            f"Ortalama sonuç: <b>%{learning['average_return']:.2f}</b>"
         )
 
     def signal(self, signal: Signal, market: MarketContext) -> None:
@@ -819,10 +1186,13 @@ class TelegramNotifier:
             if signal.warnings
             else ""
         )
+
         self.send(
-            "🚨 <b>COIN RADAR PRO — ADAY</b>\n\n"
+            "🚨 <b>COIN RADAR — ADAY</b>\n\n"
             f"<b>{signal.symbol.replace('TRY', '/TRY')}</b>\n"
             f"Puan: <b>{signal.score:.0f}/100</b>\n"
+            f"Ham puan: <b>{signal.raw_score:.1f}</b>\n"
+            f"Öğrenme etkisi: <b>{signal.learning_bonus:+.1f}</b>\n"
             f"Anlık: <b>{format_price(signal.price)}</b>\n"
             f"24s: <b>%{signal.change_24h:.2f}</b>\n\n"
             f"🟢 Giriş: <b>{format_price(signal.entry_low)} – "
@@ -837,86 +1207,135 @@ class TelegramNotifier:
             f"<b>Neden?</b>\n{reasons}"
             f"{warnings}\n\n"
             f"BTC: {market.btc_symbol} | 24s %{market.btc_change_24h:.2f}\n\n"
-            "Bu otomatik ön elemedir. İşlemden önce güncel grafik, "
-            "haber ve emir defteri son kez kontrol edilmelidir."
+            "Bu otomatik ön elemedir; işlem emri değildir."
         )
 
 
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
+# ============================================================
+# APPLICATION
+# ============================================================
 
 class RadarApp:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
+
         logging.basicConfig(
             level=getattr(logging, cfg.log_level, logging.INFO),
             format="%(asctime)s | %(levelname)s | %(message)s",
         )
+
         self.http = HttpClient(cfg.request_timeout_seconds)
         self.exchange = BinanceTRClient(self.http)
         self.telegram = TelegramNotifier(self.http, cfg)
-        self.storage = Storage(cfg.state_file, cfg.signal_log_file)
+        self.learner = LearningEngine(
+            db_path=cfg.learning_db_path,
+            enabled=cfg.learning_enabled,
+            min_samples=cfg.learning_min_samples,
+            max_bonus=cfg.learning_max_bonus,
+        )
+        self.duplicate_store = DuplicateStore(cfg.learning_db_path)
+
         self.last_heartbeat_at = 0.0
+        self.last_learning_review_at = 0.0
+        self.last_performance_report_at = 0.0
 
     def scan_once(self) -> Tuple[int, int]:
         scan_started = time.time()
         logging.info("Tarama turu başladı.")
 
+        now = time.time()
+
+        if (
+            self.cfg.learning_enabled
+            and now - self.last_learning_review_at
+            >= self.cfg.learning_review_minutes * 60
+        ):
+            reviewed = self.learner.review_open_signals(self.exchange)
+            if reviewed:
+                logging.info("%s açık sinyal sonuçlandırıldı.", reviewed)
+            self.last_learning_review_at = now
+
         tickers = self.exchange.tickers_24h()
         books = self.exchange.book_tickers()
+
         logging.info(
-            "Ticker verisinden %s TRY paritesi keşfedildi.", len(tickers)
+            "Ticker verisinden %s TRY paritesi keşfedildi.",
+            len(tickers)
         )
 
         market = build_market_context(self.exchange, tickers)
-        logging.info(
-            "BTC bağlamı: %s, 24s=%.2f, risk_off=%s",
-            market.btc_symbol,
-            market.btc_change_24h,
-            market.risk_off,
-        )
 
         ranked: List[Tuple[float, str]] = []
         for symbol, ticker in tickers.items():
             if symbol == "BTCTRY":
                 continue
-            score = prefilter_score(ticker, books.get(symbol, {}), self.cfg)
+
+            score = prefilter_score(
+                ticker,
+                books.get(symbol, {}),
+                self.cfg,
+            )
+
             if score is not None:
                 ranked.append((score, symbol))
+
         ranked.sort(reverse=True)
-        selected = [symbol for _, symbol in ranked[: self.cfg.max_prefilter_symbols]]
+        selected = [
+            symbol
+            for _, symbol in ranked[: self.cfg.max_prefilter_symbols]
+        ]
+
         logging.info(
-            "Ön filtreden %s coin geçti; en iyi %s coin detaylı incelenecek.",
+            "Ön filtreden %s coin geçti; %s coin detaylı incelenecek.",
             len(ranked),
             len(selected),
         )
 
         candidates: List[Signal] = []
         scanned = 0
+
         for index, symbol in enumerate(selected, start=1):
             try:
                 ticker = tickers[symbol]
                 book = books[symbol]
+
                 m5 = calculate_metrics(self.exchange.klines(symbol, "5m"))
                 m15 = calculate_metrics(self.exchange.klines(symbol, "15m"))
                 m1h = calculate_metrics(self.exchange.klines(symbol, "1h"))
                 m4h = calculate_metrics(self.exchange.klines(symbol, "4h"))
+
                 signal = evaluate_signal(
-                    symbol, ticker, book, m5, m15, m1h, m4h,
-                    market, self.cfg
+                    symbol=symbol,
+                    ticker=ticker,
+                    book=book,
+                    m5=m5,
+                    m15=m15,
+                    m1h=m1h,
+                    m4h=m4h,
+                    market=market,
+                    cfg=self.cfg,
+                    learner=self.learner,
                 )
+
                 scanned += 1
+
                 if signal:
                     candidates.append(signal)
                     logging.info(
-                        "Aday: %s puan=%.1f", symbol, signal.score
+                        "Aday: %s puan=%.1f",
+                        symbol,
+                        signal.score,
                     )
+
                 if index % 10 == 0:
                     logging.info(
-                        "Tarama ilerlemesi: %s/%s", index, len(selected)
+                        "Tarama ilerlemesi: %s/%s",
+                        index,
+                        len(selected),
                     )
+
                 time.sleep(self.cfg.request_pause_seconds)
+
             except Exception as exc:
                 logging.warning("%s incelenemedi: %s", symbol, exc)
 
@@ -929,19 +1348,18 @@ class RadarApp:
             reverse=True,
         )
 
-        # No daily cap: every candidate passing quality and duplicate controls is sent.
         sent_count = 0
-        now = time.time()
+
         for signal in candidates:
-            if self.storage.should_send(
+            if self.duplicate_store.should_send(
                 signal,
-                now,
-                self.cfg.cooldown_minutes,
-                self.cfg.resignal_score_improvement,
+                cooldown_minutes=self.cfg.cooldown_minutes,
+                required_improvement=self.cfg.resignal_score_improvement,
             ):
                 self.telegram.signal(signal, market)
-                self.storage.mark_sent(signal, now)
+                self.learner.record_signal(signal)
                 sent_count += 1
+
                 logging.info(
                     "Telegram sinyali gönderildi: %s puan=%.1f",
                     signal.symbol,
@@ -949,6 +1367,7 @@ class RadarApp:
                 )
 
         elapsed = time.time() - scan_started
+
         logging.info(
             "Tarama tamamlandı: incelenen=%s aday=%s gönderilen=%s süre=%.1fs",
             scanned,
@@ -957,39 +1376,60 @@ class RadarApp:
             elapsed,
         )
 
+        learning_summary = self.learner.summary()
+
         if (
             now - self.last_heartbeat_at
             >= self.cfg.heartbeat_minutes * 60
         ):
-            self.telegram.heartbeat(scanned, len(candidates), elapsed)
+            self.telegram.heartbeat(
+                scanned=scanned,
+                candidates=len(candidates),
+                elapsed=elapsed,
+                learning=learning_summary,
+            )
             self.last_heartbeat_at = now
+
+        if (
+            now - self.last_performance_report_at
+            >= self.cfg.performance_report_hours * 3600
+        ):
+            self.telegram.performance_report(learning_summary)
+            self.last_performance_report_at = now
 
         return scanned, len(candidates)
 
     def run(self) -> None:
-        logging.info("Coin Radar Pro v3 başlatılıyor.")
+        logging.info("Coin Radar Stable başlatılıyor.")
+
         if self.cfg.send_startup_message:
             self.telegram.startup()
+
         logging.info("Telegram başlangıç mesajı gönderildi.")
 
         consecutive_errors = 0
+
         while True:
             started = time.time()
+
             try:
                 self.scan_once()
                 consecutive_errors = 0
+
             except KeyboardInterrupt:
                 logging.info("Kapatılıyor.")
                 return
+
             except Exception:
                 consecutive_errors += 1
                 logging.exception(
-                    "Tarama turu hata verdi (ardışık=%s).",
+                    "Tarama turu hata verdi; ardışık hata=%s",
                     consecutive_errors,
                 )
 
             elapsed = time.time() - started
             wait = max(5.0, self.cfg.scan_interval_seconds - elapsed)
+
             logging.info("Sonraki tur %.0f saniye sonra.", wait)
             time.sleep(wait)
 
