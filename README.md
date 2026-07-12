@@ -1,30 +1,28 @@
-# Coin Radar AI — Stable Adaptive Edition
+# Coin Radar AI — Stable Adaptive + GitHub Persistence
 
-Bu sürüm Binance TR TRY paritelerini 5 dk, 15 dk, 1 saat ve 4 saat zaman dilimlerinde tarar.
+Binance TR TRY paritelerini 5 dk, 15 dk, 1 saat ve 4 saat zaman dilimlerinde tarar. Sabit `%4` hedef kullanmaz; hedef alanını ATR, dirençler, hacim, trend gücü, BTC bağlamı ve geçmiş sonuçlara göre dinamik belirler. Güçlü harekette takip eden stopla pozisyonu taşır.
 
-## Ana fark
-
-Sabit `%4` satış hedefi kaldırılmıştır. İlk karar bölgesi ve hedef alanı şu verilerden dinamik hesaplanır:
-
-- ATR ve stop mesafesi
-- Yakın/uzak dirençler
-- EMA trend dizilimi
-- ADX trend gücü
-- RSI, MACD ve Bollinger yapısı
-- Göreceli hacim
-- BTC piyasa bağlamı
-- Geçmiş sinyallerin MFE ve getiri sonuçları
-
-İlk hedefe ulaşılması otomatik tam satış anlamına gelmez. Trend güçlü kalırsa takip eden stop yükseltilir.
-
-## Railway değişkenleri
-
-Zorunlu:
+## Railway zorunlu değişkenleri
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
-Önerilen:
+## GitHub kalıcı öğrenme değişkenleri
+
+- `GITHUB_BACKUP_ENABLED=true`
+- `GITHUB_BACKUP_TOKEN=<GitHub fine-grained token>`
+- `GITHUB_BACKUP_REPOSITORY=kullaniciadi/repo-adi`
+- `GITHUB_BACKUP_BRANCH=main`
+- `GITHUB_BACKUP_DB_PATH=radar-data/radar_learning.db`
+- `GITHUB_BACKUP_INTERVAL_MINUTES=30`
+- `GITHUB_BACKUP_MIN_CHANGES=10`
+- `LEARNING_DB_PATH=/tmp/radar_learning.db`
+
+Token için yalnızca seçilen repository üzerinde **Contents: Read and write** izni yeterlidir. Token'ı koda veya GitHub repository içine yazmayın; yalnızca Railway Variables bölümüne ekleyin.
+
+Bot açılışta GitHub'daki son SQLite yedeğini geri yükler. Çalışırken en geç 30 dakikada bir veya 10 veritabanı değişikliğinde bir güvenli SQLite snapshot'ını GitHub'a gönderir. Railway yeniden başlasa veya yeniden deploy edilse bile öğrenme geçmişi geri gelir.
+
+## Diğer önerilen değişkenler
 
 - `SCAN_INTERVAL_SECONDS=180`
 - `MIN_SCORE=80`
@@ -36,11 +34,8 @@ Zorunlu:
 - `MAX_HOLD_HOURS=12`
 - `LEARNING_ENABLED=true`
 - `LEARNING_MIN_SAMPLES=20`
-- `LEARNING_DB_PATH=/data/radar_learning.db`
 
-Railway Volume mount path: `/data`
-
-## Kurulum
+## Çalıştırma
 
 ```bash
 pip install -r requirements.txt
