@@ -109,7 +109,7 @@ class Settings:
             request_timeout_seconds=max(5, env_int("REQUEST_TIMEOUT_SECONDS", 12)),
             request_pause_seconds=max(0.03, env_float("REQUEST_PAUSE_SECONDS", 0.08)),
             max_prefilter_symbols=max(15, env_int("MAX_PREFILTER_SYMBOLS", 55)),
-            min_score=env_float("MIN_SCORE", 80.0),
+            min_score=env_float("MIN_SCORE", 82.0),
             min_24h_try_volume=env_float("MIN_24H_TRY_VOLUME", 15_000_000),
             min_24h_change=env_float("MIN_24H_CHANGE", -3.0),
             max_24h_change=env_float("MAX_24H_CHANGE", 16.0),
@@ -126,7 +126,7 @@ class Settings:
             learning_enabled=env_bool("LEARNING_ENABLED", True),
             learning_db_path=os.getenv("LEARNING_DB_PATH", "/data/radar_learning.db"),
             learning_min_samples=max(10, env_int("LEARNING_MIN_SAMPLES", 20)),
-            learning_max_score_bonus=env_float("LEARNING_MAX_SCORE_BONUS", 10.0),
+            learning_max_score_bonus=env_float("LEARNING_MAX_SCORE_BONUS", 5.0),
             learning_max_target_adjustment=env_float(
                 "LEARNING_MAX_TARGET_ADJUSTMENT", 0.35
             ),
@@ -531,6 +531,14 @@ class LearningEngine:
                     avg_return REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS score_calibration (
+                    score_bucket INTEGER PRIMARY KEY,
+                    target_hits REAL NOT NULL DEFAULT 0,
+                    misses REAL NOT NULL DEFAULT 0,
+                    samples INTEGER NOT NULL DEFAULT 0,
+                    avg_mfe REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                );
             """)
             conn.commit()
 
@@ -560,6 +568,33 @@ class LearningEngine:
                 edge = (posterior - 0.58) * 10 + max(-1.0, min(1.0, row["avg_return"] / 4))
                 total += max(-2.0, min(2.0, edge))
         return max(-self.cfg.learning_max_score_bonus, min(self.cfg.learning_max_score_bonus, total))
+
+    def calibrate_score(self, model_score: float) -> Tuple[float, int]:
+        """Geçmiş hedefe ulaşma oranıyla modeli temkinli biçimde kalibre eder.
+
+        Yeni sistem yeterli örnek oluşana kadar model skorunu aynen kullanır.
+        30+ örnekte ampirik başarı oranı en fazla %50 ağırlık kazanır; böylece
+        kısa bir şans/şanssızlık serisi puanı bozmaz.
+        """
+        model_score = max(0.0, min(100.0, model_score))
+        if not self.enabled:
+            return model_score, 0
+        bucket = int(model_score // 5 * 5)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT target_hits, misses, samples FROM score_calibration WHERE score_bucket=?",
+                (bucket,),
+            ).fetchone()
+        if not row or int(row["samples"]) < 30:
+            return model_score, int(row["samples"]) if row else 0
+        samples = int(row["samples"])
+        posterior = (float(row["target_hits"]) + 4.0) / (
+            float(row["target_hits"]) + float(row["misses"]) + 8.0
+        )
+        empirical_score = posterior * 100.0
+        weight = min(0.50, samples / 200.0)
+        calibrated = model_score * (1.0 - weight) + empirical_score * weight
+        return max(0.0, min(100.0, calibrated)), samples
 
     def target_multiplier(self, tags: Sequence[str], fallback: float) -> float:
         if not self.enabled:
@@ -681,6 +716,28 @@ class LearningEngine:
                         VALUES(?,?,?,?,?,?,?)
                     """, (tag, 3 + win_credit, 2 + loss_credit, 1,
                           row["mfe_percent"], realized, now))
+
+            # Puanın doğruluğunu gerçek hedefe ulaşma sonucuyla kalibre et.
+            bucket = int(float(row["score"]) // 5 * 5)
+            hit = 1.0 if int(row["target_touched"] or 0) else 0.0
+            miss = 1.0 - hit
+            cal = conn.execute(
+                "SELECT * FROM score_calibration WHERE score_bucket=?", (bucket,)
+            ).fetchone()
+            if cal:
+                n = int(cal["samples"])
+                new_n = n + 1
+                avg_mfe = (float(cal["avg_mfe"]) * n + float(row["mfe_percent"])) / new_n
+                conn.execute("""
+                    UPDATE score_calibration SET target_hits=?, misses=?, samples=?,
+                    avg_mfe=?, updated_at=? WHERE score_bucket=?
+                """, (float(cal["target_hits"]) + hit, float(cal["misses"]) + miss,
+                      new_n, avg_mfe, now, bucket))
+            else:
+                conn.execute("""
+                    INSERT INTO score_calibration(score_bucket,target_hits,misses,samples,avg_mfe,updated_at)
+                    VALUES(?,?,?,?,?,?)
+                """, (bucket, hit, miss, 1, float(row["mfe_percent"]), now))
             conn.commit()
 
     def summary(self) -> Dict[str, float]:
@@ -832,86 +889,104 @@ def evaluate_signal(
     bid = ticker_float(book, "bidPrice", "bid")
     ask = ticker_float(book, "askPrice", "ask")
     spread = (ask - bid) / max((ask + bid) / 2, 1e-12) * 100
-    if cfg.btc_filter_enabled and market.risk_off:
+
+    # Önce zorunlu kalite kapıları. Puan yüksek olsa bile zayıf yapı sinyal olamaz.
+    if cfg.btc_filter_enabled and (market.risk_off or not market.btc_1h_ok):
         return None
-    if m15.atr_percent <= 0.15 or m15.atr_percent > 6:
+    if not (0.20 <= m15.atr_percent <= 5.0):
+        return None
+    if not (m1h.ema20 > m1h.ema50):
+        return None
+    effective_rvol = max(m15.rvol, m15.quote_rvol)
+    if effective_rvol < 1.15 or effective_rvol > 6.0:
+        return None
+    if m15.adx14 < 18 or m15.plus_di <= m15.minus_di:
+        return None
+    if not (47 <= m15.rsi14 <= 70):
+        return None
+    if m15.upper_wick_ratio > 0.68:
+        return None
+    if m5.roc5 > 4.5:
         return None
 
-    score = 0.0
+    raw_quality = 0.0
     reasons: List[str] = []
     warnings: List[str] = []
 
     if m15.ema9 > m15.ema20 > m15.ema50:
-        score += 16; reasons.append("15 dk EMA dizilimi güçlü")
+        raw_quality += 16; reasons.append("15 dk EMA dizilimi güçlü")
     elif m15.ema20 > m15.ema50:
-        score += 10; reasons.append("15 dk trend yukarı")
+        raw_quality += 9; reasons.append("15 dk trend yukarı")
     else:
-        score -= 15
+        raw_quality -= 18
 
-    if m1h.ema20 > m1h.ema50:
-        score += 15; reasons.append("1 saat trend yukarı")
+    raw_quality += 15; reasons.append("1 saat trend yukarı")
+
+    if m4h.price > m4h.ema20 and m4h.ema20 >= m4h.ema50:
+        raw_quality += 10; reasons.append("4 saat ana trend destekli")
+    elif m4h.price > m4h.ema20:
+        raw_quality += 4
     else:
-        score -= 15
+        raw_quality -= 10; warnings.append("4 saat trend karşı")
 
-    if m4h.price > m4h.ema20:
-        score += 8; reasons.append("4 saat ana trend destekli")
+    if 1.35 <= effective_rvol <= 3.8:
+        raw_quality += 18; reasons.append(f"göreceli hacim {effective_rvol:.1f}x")
+    elif 1.15 <= effective_rvol < 1.35:
+        raw_quality += 6
     else:
-        score -= 8
+        raw_quality -= 8; warnings.append("hacim aşırı hızlanmış")
 
-    effective_rvol = max(m15.rvol, m15.quote_rvol)
-    if 1.35 <= effective_rvol <= 4.5:
-        score += 18; reasons.append(f"göreceli hacim {effective_rvol:.1f}x")
-    elif 1.05 <= effective_rvol < 1.35:
-        score += 7
-    elif effective_rvol > 6:
-        score -= 12; warnings.append("hacim aşırı patlamış")
+    if m15.adx14 >= 25:
+        raw_quality += 11; reasons.append(f"ADX trend gücü {m15.adx14:.0f}")
     else:
-        score -= 8
+        raw_quality += 3
 
-    if m15.adx14 >= 25 and m15.plus_di > m15.minus_di:
-        score += 10; reasons.append(f"ADX trend gücü {m15.adx14:.0f}")
-    elif m15.plus_di < m15.minus_di:
-        score -= 7
+    if 52 <= m15.rsi14 <= 64:
+        raw_quality += 12; reasons.append(f"RSI sağlıklı {m15.rsi14:.0f}")
+    elif 48 <= m15.rsi14 <= 68:
+        raw_quality += 5
+    else:
+        raw_quality -= 7
 
-    if 51 <= m15.rsi14 <= 67:
-        score += 12; reasons.append(f"RSI sağlıklı {m15.rsi14:.0f}")
-    elif m15.rsi14 > 73:
-        score -= 15; warnings.append("RSI aşırı ısınmış")
-
-    if m15.macd_hist > 0 and m15.macd_hist >= m15.macd_hist_previous:
-        score += 10; reasons.append("MACD ivmesi pozitif")
-    elif m15.macd_hist < m15.macd_hist_previous:
-        score -= 5
+    if m15.macd_hist > 0 and m15.macd_hist > m15.macd_hist_previous:
+        raw_quality += 11; reasons.append("MACD ivmesi güçleniyor")
+    elif m15.macd_hist >= m15.macd_hist_previous:
+        raw_quality += 3
+    else:
+        raw_quality -= 9; warnings.append("MACD ivmesi zayıflıyor")
 
     if m15.bb_width_previous < 0.07 and m15.bb_width > m15.bb_width_previous:
-        score += 10; reasons.append("Bollinger sıkışması açılıyor")
+        raw_quality += 9; reasons.append("Bollinger sıkışması açılıyor")
 
     breakout_distance = (price - m15.prior_high_20) / max(m15.prior_high_20, 1e-12) * 100
-    if -1.0 <= breakout_distance <= 1.8:
-        score += 9; reasons.append("kırılıma yakın kontrollü bölge")
-    elif breakout_distance > 3.5:
-        score -= 12; warnings.append("hareket fazla uzamış")
+    if -0.8 <= breakout_distance <= 1.2:
+        raw_quality += 11; reasons.append("kırılım bölgesinde kontrollü")
+    elif -1.8 <= breakout_distance < -0.8:
+        raw_quality += 3
+    elif breakout_distance > 2.5:
+        raw_quality -= 15; warnings.append("hareket uzamış")
+    else:
+        raw_quality -= 5
 
-    if m15.upper_wick_ratio > 0.55:
-        score -= 9; warnings.append("üst fitil satış baskısı")
-    if m15.close_position > 0.75 and m15.body_percent >= 0.5:
-        score += 5
-    if m5.roc5 > 3.5:
-        score -= 7; warnings.append("5 dk ivme aşırı hızlı")
+    if m15.upper_wick_ratio > 0.50:
+        raw_quality -= 10; warnings.append("üst fitil satış baskısı")
+    elif m15.close_position > 0.72 and m15.body_percent >= 0.40:
+        raw_quality += 6
 
-    if 0.3 <= change <= 7.5:
-        score += 8; reasons.append(f"24s hareket kontrollü %{change:.1f}")
-    elif change > 11:
-        score -= 10
+    if 0.2 <= change <= 6.5:
+        raw_quality += 8; reasons.append(f"24s hareket kontrollü %{change:.1f}")
+    elif change > 9.0:
+        raw_quality -= 12; warnings.append("24 saatlik hareket uzamış")
 
-    if cfg.btc_filter_enabled:
-        if market.btc_15m_ok and market.btc_1h_ok:
-            score += 8; reasons.append("BTC yönü destekli")
-        elif not market.btc_1h_ok:
-            score -= 7; warnings.append("BTC 1 saat zayıf")
+    if cfg.btc_filter_enabled and market.btc_15m_ok and market.btc_1h_ok:
+        raw_quality += 8; reasons.append("BTC yönü destekli")
 
     atr = max(m15.atr14, price * 0.0035)
-    support = max(m15.ema20, m15.bb_mid, m15.recent_low_20 + 0.30 * (m15.recent_high_20 - m15.recent_low_20))
+    support = max(
+        m15.ema20,
+        m15.bb_mid,
+        m15.recent_low_20 + 0.30 * (m15.recent_high_20 - m15.recent_low_20),
+    )
     entry_high = max(ask, price)
     entry_low = max(support, price - 0.30 * atr)
     structural_stop = min(m15.ema20 - 0.55 * atr, m15.recent_low_20 - 0.15 * atr)
@@ -924,29 +999,51 @@ def evaluate_signal(
     stop_percent = (entry_high - initial_stop) / entry_high * 100
     if not (cfg.min_stop_percent <= stop_percent <= cfg.max_stop_percent):
         return None
+    risk = entry_high - initial_stop
+
+    # Yakın direnç varsa yüksek puan üretme. Hedefe gerçek alan bırakılmalı.
+    resistances = [
+        x for x in (m15.recent_high_20, m15.recent_high_50, m1h.recent_high_20, m4h.recent_high_20)
+        if x > entry_high * 1.002
+    ]
+    if resistances:
+        room_r = (min(resistances) - entry_high) / max(risk, 1e-12)
+        if room_r < 1.20:
+            return None
+        if room_r < cfg.min_risk_reward:
+            raw_quality -= 14; warnings.append("ilk direnç hedef alanını daraltıyor")
+        elif room_r >= 2.2:
+            raw_quality += 5; reasons.append("dirence kadar yeterli alan var")
 
     tags = setup_tags(m5, m15, m1h, m4h, market)
-    learning_bonus = learner.score_bonus(tags)
-    raw_score = score
-    score += learning_bonus
-    if learning_bonus:
-        reasons.append(f"öğrenme etkisi {learning_bonus:+.1f} puan")
+    feature_adjustment = learner.score_bonus(tags)
+
+    # Ham puan doğrudan 100'e eklenmez. Lojistik dönüşüm 90+ puanı elit yapar.
+    model_score = 45.0 + 50.0 / (1.0 + math.exp(-(raw_quality - 102.0) / 12.0))
+    model_score += feature_adjustment
+    model_score = max(0.0, min(97.0, model_score))
+    score, calibration_samples = learner.calibrate_score(model_score)
+    score = max(0.0, min(97.0, score))
+
+    if feature_adjustment:
+        reasons.append(f"öğrenme etkisi {feature_adjustment:+.1f} puan")
+    if calibration_samples >= 30:
+        reasons.append(f"puan {calibration_samples} geçmiş sinyalle kalibre")
     if score < cfg.min_score:
         return None
 
     initial_target, zone_high, trail_activation_r, trail_atr_multiplier, strength = dynamic_target_plan(
         entry_high, initial_stop, m5, m15, m1h, m4h, market, tags, learner, cfg
     )
-    risk = entry_high - initial_stop
     rr = (initial_target - entry_high) / max(risk, 1e-12)
     if rr < cfg.min_risk_reward:
         return None
 
     return Signal(
         symbol=symbol,
-        score=round(min(score, 100), 1),
-        raw_score=round(raw_score, 1),
-        learning_bonus=round(learning_bonus, 1),
+        score=round(score, 1),
+        raw_score=round(model_score, 1),
+        learning_bonus=round(feature_adjustment, 1),
         price=price,
         entry_low=entry_low,
         entry_high=entry_high,
